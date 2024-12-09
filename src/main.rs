@@ -1,5 +1,4 @@
-use ndarray::Array2;
-use ndarray::Array1;
+use ndarray::prelude::*;
 use std::error::Error;
 use csv::Reader;
 use std::collections::HashMap;
@@ -59,26 +58,76 @@ fn build_dataset(alphabet: Vec<String>, mut words: Vec<String>)-> (Vec<VecDeque<
     (x,y)
 }
 
+fn construct_batch(data: Vec<VecDeque<usize>>) -> Vec<VecDeque<usize>> {
+    let mut rng = rand::thread_rng();
+    let batch_indices: Vec<usize> = (0..BATCH_SIZE).map(|_| rng.gen_range(0..data.len())).collect();
+    let mut batch: Vec<VecDeque<usize>> = Vec::new();
+    for i in batch_indices.iter(){
+        let datum = data.get(i.clone()).unwrap();
+        batch.push(datum.clone());
+    }
+    return batch
+}
+
 struct Network {
+    lookup_table: Array2<f64>, //C
     input_weights: Array2<f64>, //W1
     output_weights: Array2<f64>, //W2
     output_bias: Array1<f64>, //b2
 }
 
+impl Network {
+    fn new(hidden_size: usize) -> Network {
+        let mut rng = rand::thread_rng();
+        let lookup_table = Array2::from_shape_fn((27, DIMENSIONS), |_| rng.gen_range(0.0..1.0));
+        let input_weights = Array2::from_shape_fn((BLOCK_SIZE*DIMENSIONS, hidden_size), |_| rng.gen_range(0.0..1.0));
+        let output_weights = Array2::from_shape_fn((hidden_size, 10), |_| rng.gen_range(0.0..1.0));
+        let output_bias = Array1::from_shape_fn(10, |_| rng.gen_range(0.0..1.0));
+        Network {lookup_table,input_weights,output_weights, output_bias}
+    }
+    fn sigmoid(x: Array2<f64>) -> Array2<f64> {
+        x.mapv(|z| 1.0 / (1.0 + (-z).exp()))
+    }
 
+    fn embed(&self, labels: VecDeque<usize>) -> Vec<Vec<f64>> {
+        let mut rows: Vec<Vec<f64>> = Vec::new();
+        for &elem in labels.iter() {
+            let embedding = self.lookup_table.slice(s![elem, .. ]).to_owned();
+            rows.push(embedding.to_vec());
+        }
+    rows
+    }
+
+    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> Array2<f64> {
+        let mut emb_vec: Vec<Vec<f64>> = Vec::new();
+        for x in batch.iter(){
+            let embedding = self.embed(x.clone());
+            emb_vec.push(embedding.into_iter().flatten().collect());
+        }
+        let emb_array: Array2<f64> = Array2::from_shape_vec((BATCH_SIZE, BLOCK_SIZE*DIMENSIONS ), emb_vec.into_iter().flatten().collect()).unwrap();
+        let z1: Array2<f64> = emb_array.dot(&self.input_weights);
+        let a1 = Network::sigmoid(z1);
+        let z2 = a1.dot(&self.output_weights) + self.output_bias.clone();
+        let a2 = Network::sigmoid(z2);
+        println!("{:?}", a2);
+        return a2
+        
+
+    }
+}
 
 fn main() {
     let alphab = load_data("Alphabet Set.csv").expect("Unable to load alphabet");
     let mut list = load_data("1900 Names.csv").expect("Unable to load Names");
     let (x,y) = build_dataset(alphab, list);
-    let batch = construct_batch(100, x);
-    for i in batch{
-        let encoded = one_hot_encode(i);
-        println!("{:?}", encoded);
-    }
+    let batch = construct_batch(x);
+    let nnet = Network::new(5);
+    let a = nnet.forward_pass(batch);
     //println!("{:?}",batch);
 }
 
-const BLOCK_SIZE: usize = 3;
-const BATCH_SIZE: usize = 50;
-const DIMENSIONS: usize = 3;
+const BLOCK_SIZE: usize = 2;
+const BATCH_SIZE: usize = 3;
+const DIMENSIONS: usize = 2;
+
+// test ideas: ensure indexing into the lookup table is working correctly (embeddig func)

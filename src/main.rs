@@ -4,6 +4,7 @@ use csv::Reader;
 use std::collections::HashMap;
 use std::collections::VecDeque;
 use rand::Rng;
+use std::ops::AddAssign;
 
 // Load Data in
 
@@ -58,17 +59,28 @@ fn build_dataset(alphabet: Vec<String>, mut words: Vec<String>)-> (Vec<VecDeque<
     (x,y)
 }
 
-fn construct_batch(data: Vec<VecDeque<usize>>) -> Vec<VecDeque<usize>> {
+fn construct_batch(data: &Vec<VecDeque<usize>>, y: &Vec<usize>) -> (Vec<VecDeque<usize>>, Vec<usize>) {
     let mut rng = rand::thread_rng();
     let batch_indices: Vec<usize> = (0..BATCH_SIZE).map(|_| rng.gen_range(0..data.len())).collect();
-    let mut batch: Vec<VecDeque<usize>> = Vec::new();
+    let mut x_batch: Vec<VecDeque<usize>> = Vec::new();
+    let mut y_batch: Vec<usize> = Vec::new();
     for i in batch_indices.iter(){
-        let datum = data.get(i.clone()).unwrap();
-        batch.push(datum.clone());
+        x_batch.push(data.get(i.clone()).unwrap().clone());
+        y_batch.push(y.get(i.clone()).unwrap().clone());
     }
-    return batch
+    return (x_batch,y_batch)
 }
 
+fn cross_entropy_loss(probs: Array2<f64>, y_batch: Vec<usize>) -> f64 {
+    let mut probs_correct: Vec<f64> = Vec::new();
+    for (index, corr_output) in y_batch.iter().enumerate() {
+        probs_correct.push(probs[(index.clone(), corr_output.clone())]);
+    }
+    let loss = -probs_correct.iter().map(|x| x.ln()).clone().sum::<f64>() / (probs_correct.len().clone() as f64);
+    loss
+    
+}
+#[derive(Clone)]
 struct Network {
     lookup_table: Array2<f64>, //C
     input_weights: Array2<f64>, //W1
@@ -77,12 +89,12 @@ struct Network {
 }
 
 impl Network {
-    fn new(hidden_size: usize) -> Network {
+    fn new() -> Network {
         let mut rng = rand::thread_rng();
         let lookup_table = Array2::from_shape_fn((27, DIMENSIONS), |_| rng.gen_range(0.0..1.0));
-        let input_weights = Array2::from_shape_fn((BLOCK_SIZE*DIMENSIONS, hidden_size), |_| rng.gen_range(0.0..1.0));
-        let output_weights = Array2::from_shape_fn((hidden_size, 10), |_| rng.gen_range(0.0..1.0));
-        let output_bias = Array1::from_shape_fn(10, |_| rng.gen_range(0.0..1.0));
+        let input_weights = Array2::from_shape_fn((BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE), |_| rng.gen_range(0.0..1.0));
+        let output_weights = Array2::from_shape_fn((HIDDEN_SIZE, 27), |_| rng.gen_range(0.0..1.0));
+        let output_bias = Array1::from_shape_fn(27, |_| rng.gen_range(0.0..1.0));
         Network {lookup_table,input_weights,output_weights, output_bias}
     }
     fn sigmoid(x: Array2<f64>) -> Array2<f64> {
@@ -98,7 +110,7 @@ impl Network {
     rows
     }
 
-    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> Array2<f64> {
+    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> (Array2<f64>,Array2<f64>) {
         let mut emb_vec: Vec<Vec<f64>> = Vec::new();
         for x in batch.iter(){
             let embedding = self.embed(x.clone());
@@ -107,27 +119,58 @@ impl Network {
         let emb_array: Array2<f64> = Array2::from_shape_vec((BATCH_SIZE, BLOCK_SIZE*DIMENSIONS ), emb_vec.into_iter().flatten().collect()).unwrap();
         let z1: Array2<f64> = emb_array.dot(&self.input_weights);
         let a1 = Network::sigmoid(z1);
-        let z2 = a1.dot(&self.output_weights) + self.output_bias.clone();
+        let z2 = a1.clone().dot(&self.output_weights) + self.output_bias.clone();
         let a2 = Network::sigmoid(z2);
-        println!("{:?}", a2);
-        return a2
-        
-
+        let mut probs = a2.map(|x| x.exp());
+        for mut row in probs.axis_iter_mut(Axis(0)) {
+            let row_sum: f64 = row.iter().sum::<f64>().clone();
+            row /= row_sum;
+        }
+        return (probs,a1)
+    }
+    fn backwards_pass(&self, probs: Array2<f64>, a1: Array2<f64>, y_batch: Vec<usize>) -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>){
+        let mut grad_z2 = probs.clone();
+        for (index, corr_output) in y_batch.iter().enumerate(){
+            grad_z2[(index, corr_output.clone())] -= 1.0; // subtracting 1 from targets to backpropagate over cross entropy loss
+        }
+        let grad_a1 = grad_z2.dot(&self.output_weights.t()) * &a1 * (1.0 - &a1); //calculating gradient over softmax (sigmoid)
+        let grad_output_weights = grad_z2.t().dot(&a1); 
+        let grad_output_bias = grad_z2.sum_axis(Axis(0));
+        let grad_input_weights = a1.t().dot(&grad_a1);
+        let grad_lookup_table = grad_a1.dot(&self.input_weights.t());
+        return (grad_lookup_table,grad_input_weights,grad_output_weights,grad_output_bias)
+    }
+    fn update(&mut self, learning_rate: f64, gradients: (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>)) {
+        let (grad_lookup_table,grad_input_weights,grad_output_weights,grad_output_bias) = gradients;
+        self.lookup_table = self.lookup_table.clone() + grad_lookup_table * learning_rate;
+        self.input_weights = self.input_weights.clone() + grad_input_weights * learning_rate;
+        //self.output_weights = self.output_weights.clone() + grad_output_weights * learning_rate;
+        self.output_bias = self.output_bias.clone() + grad_output_bias * learning_rate;
     }
 }
 
 fn main() {
     let alphab = load_data("Alphabet Set.csv").expect("Unable to load alphabet");
     let mut list = load_data("1900 Names.csv").expect("Unable to load Names");
+    let mut nnet = Network::new();
     let (x,y) = build_dataset(alphab, list);
-    let batch = construct_batch(x);
-    let nnet = Network::new(5);
-    let a = nnet.forward_pass(batch);
-    //println!("{:?}",batch);
+    
+// build training loop:
+    for _ in 0..BATCHES{
+        let (x_batch,y_batch) = construct_batch(&x,&y);
+        let (p,a1) = nnet.clone().forward_pass(x_batch);
+        let bp = nnet.backwards_pass(p.clone(),a1,y_batch.clone());
+        let loss = cross_entropy_loss(p,y_batch);
+        nnet.update(LEARNING_RATE, bp);
+        println!("{:?}", loss);
+    }
 }
 
-const BLOCK_SIZE: usize = 2;
-const BATCH_SIZE: usize = 3;
-const DIMENSIONS: usize = 2;
+const BLOCK_SIZE: usize = 3;
+const BATCH_SIZE: usize = 50;
+const DIMENSIONS: usize = 10;
+const HIDDEN_SIZE: usize = 15;
+const BATCHES: usize = 3;
+const LEARNING_RATE: f64 = 0.01;
 
 // test ideas: ensure indexing into the lookup table is working correctly (embeddig func)

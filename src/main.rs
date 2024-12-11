@@ -72,15 +72,23 @@ fn construct_batch(data: &Vec<VecDeque<usize>>, y: &Vec<usize>) -> (Vec<VecDeque
 }
 
 fn cross_entropy_loss(probs: Array2<f64>, y_batch: Vec<usize>) -> f64 {
-    let mut probs_correct: Vec<f64> = Vec::new();
-    for (index, corr_output) in y_batch.iter().enumerate() {
-        probs_correct.push(probs[(index.clone(), corr_output.clone())]);
+    let mut loss = 0.0;
+    for (index, &corr_output) in y_batch.iter().enumerate() {
+        loss -= probs[(index, corr_output)].ln();
     }
-    let loss = -probs_correct.iter().map(|x| x.ln()).clone().sum::<f64>() / (probs_correct.len().clone() as f64);
-    loss
+    loss / y_batch.len() as f64
     
 }
-#[derive(Clone)]
+
+fn xavier_initialization(rows: usize, cols: usize) -> Array2<f64> {
+    let mut rng = rand::thread_rng();
+    let fan_in = rows as f64;
+    let fan_out = cols as f64;
+    let limit = (6.0 / (fan_in + fan_out)).sqrt();
+    Array2::from_shape_fn((rows, cols), |_| rng.gen_range(-limit..limit))
+}
+
+#[derive(Clone, Debug)]
 struct Network {
     lookup_table: Array2<f64>, //C
     input_weights: Array2<f64>, //W1
@@ -91,14 +99,21 @@ struct Network {
 impl Network {
     fn new() -> Network {
         let mut rng = rand::thread_rng();
-        let lookup_table = Array2::from_shape_fn((27, DIMENSIONS), |_| rng.gen_range(0.0..1.0));
-        let input_weights = Array2::from_shape_fn((BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE), |_| rng.gen_range(0.0..1.0));
-        let output_weights = Array2::from_shape_fn((HIDDEN_SIZE, 27), |_| rng.gen_range(0.0..1.0));
+        let lookup_table = xavier_initialization(27,DIMENSIONS);
+        let input_weights = xavier_initialization(BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE);
+        let output_weights = xavier_initialization(HIDDEN_SIZE,27);
         let output_bias = Array1::from_shape_fn(27, |_| rng.gen_range(0.0..1.0));
         Network {lookup_table,input_weights,output_weights, output_bias}
     }
-    fn sigmoid(x: Array2<f64>) -> Array2<f64> {
-        x.mapv(|z| 1.0 / (1.0 + (-z).exp()))
+    //fn sigmoid(x: Array2<f64>) -> Array2<f64> {
+        //x.mapv(|z| 1.0 / (1.0 + (-z).exp()))
+    //}
+
+    fn ReLu(x:Array2<f64>) -> Array2<f64> {
+        x.mapv(|z| z.max(0.0))
+    }
+    fn ReLu_Deriv(x: Array2<f64>) -> Array2<f64> {
+        x.mapv(|z| if z>0.0 {1.0} else {0.0})
     }
 
     fn embed(&self, labels: VecDeque<usize>) -> Vec<Vec<f64>> {
@@ -115,7 +130,7 @@ impl Network {
             let mut big_vec = Vec::new();
             let mut row_as_vec = row.to_vec();
             for i in 0..BLOCK_SIZE{
-                let new_row = &row_as_vec[(DIMENSIONS*i..DIMENSIONS*(i+1))];
+                let new_row = &row_as_vec[DIMENSIONS*i..DIMENSIONS*(i+1)];
                 big_vec.push(new_row.to_vec());
             }
             unembedded.push(big_vec);
@@ -123,7 +138,7 @@ impl Network {
     unembedded
     }
 
-    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> (Array2<f64>,Array2<f64>, Array2<f64>) {
+    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> (Array2<f64>,Array2<f64>, Array2<f64>, Array2<f64>) {
         let mut emb_vec: Vec<Vec<f64>> = Vec::new();
         for x in batch.iter(){
             let embedding = self.embed(x.clone());
@@ -132,59 +147,40 @@ impl Network {
         let emb_array: Array2<f64> = Array2::from_shape_vec((BATCH_SIZE, BLOCK_SIZE*DIMENSIONS ), emb_vec.into_iter().flatten().collect()).unwrap();
         //println!("emb_array: {:?}", &emb_array);
         let z1: Array2<f64> = emb_array.clone().dot(&self.input_weights);
-        let a1 = Network::sigmoid(z1);
+        let a1 = Network::ReLu(z1.clone());
         let z2 = a1.clone().dot(&self.output_weights) + self.output_bias.clone();
-        let a2 = Network::sigmoid(z2);
+        let a2 = Network::ReLu(z2);
         let mut probs = a2.clone().map(|x| x.exp());
         for mut row in probs.axis_iter_mut(Axis(0)) {
             let row_sum: f64 = row.iter().sum::<f64>().clone();
             row /= row_sum;
         }
-        return (probs,a1,emb_array)
+        return (probs,a1,z1,emb_array)
     }
-    fn backwards_pass(&self, probs: Array2<f64>, a1: Array2<f64>, y_batch: Vec<usize>) -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>){
+    fn backwards_pass(&self, probs: Array2<f64>, a1: Array2<f64>, z1: Array2<f64>,  emb_array: Array2<f64>, y_batch: Vec<usize>) -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>){
         let mut grad_z2 = probs.clone();
         for (index, corr_output) in y_batch.iter().enumerate(){
             grad_z2[(index, corr_output.clone())] -= 1.0; // subtracting 1 from targets to backpropagate over cross entropy loss
         }
-        let grad_a1 = grad_z2.dot(&self.output_weights.t()) * &a1 * (1.0 - &a1); //calculating gradient over softmax (sigmoid)
-        let grad_output_weights = grad_z2.t().dot(&a1); 
+        let grad_output_weights = a1.t().dot(&grad_z2); 
         let grad_output_bias = grad_z2.sum_axis(Axis(0));
-        let grad_input_weights = a1.t().dot(&grad_a1);
-        let grad_lookup_table = grad_a1.dot(&self.input_weights.t());
-        return (grad_lookup_table,grad_input_weights,grad_output_weights,grad_output_bias)
+        let grad_a1 = Network::ReLu_Deriv(z1).dot(&grad_output_weights);
+        let grad_input_weights = emb_array.t().dot(&grad_a1);
+        let grad_embedding = grad_a1.dot(&self.input_weights.t());
+        return (grad_embedding,grad_input_weights,grad_output_weights,grad_output_bias)
     }
-    fn update_lookup(&mut self, grad: Array2<f64>, x_batch: Vec<VecDeque<usize>>, emb_array:Array2<f64>){
-        let updated_emb = emb_array + grad * LEARNING_RATE;
+    fn update_lookup(&mut self, grad_embedding: Array2<f64>, x_batch: Vec<VecDeque<usize>>, emb_array:Array2<f64>){
+        let updated_emb = emb_array + grad_embedding * LEARNING_RATE;
         let unembedded = self.unembed(updated_emb);
-        let mut count_vec: Vec<usize> = vec![0;27];
-        let mut sums_vec: Vec<Vec<f64>> = vec![vec![0.0;DIMENSIONS];27];
-        //println!("unembedded: {:?}", &unembedded);
+        let mut update_vec: Vec<Vec<f64>> = vec![vec![0.0;DIMENSIONS];27];
         for (outer_ind,context) in x_batch.iter().enumerate(){
             for (inner_ind,label) in context.to_owned().iter().enumerate(){
                 let update_vals = &unembedded[outer_ind][inner_ind];
                 for (val_ind, val) in update_vals.iter().enumerate(){
-                    sums_vec[label.clone()][val_ind] += val;
-                }
-            count_vec[label.clone()] += 1;
-            }
-        }
-        let mut update_vec: Vec<Vec<f64>>= Vec::new();
-        for label_ind in 0..27{
-            let mut means: Vec<f64> = Vec::new();
-            for dim_ind in 0..DIMENSIONS{
-                if count_vec[label_ind] != 0{ // leaves with some empty vectors
-                    means.push(sums_vec[label_ind][dim_ind]/(count_vec[label_ind] as f64));
+                    update_vec[label.clone()][val_ind] += val;
                 }
             }
-            if means != []{
-                update_vec.push(means);
-            }
-            else{
-                update_vec.push(vec![0.0;DIMENSIONS]);
-            }
         }
-        println!("update vec: {:?}", &update_vec);
         let update_as_arr: Array2<f64> = Array::from_shape_vec((27, DIMENSIONS), update_vec.into_iter().flatten().collect()).unwrap();
         self.lookup_table.add_assign(&update_as_arr);
         //println!("sum_vec: {:?}", sums_vec);
@@ -206,28 +202,35 @@ fn main() {
     let mut list = load_data("1900 Names.csv").expect("Unable to load Names");
     let mut nnet = Network::new();
     let (x,y) = build_dataset(alphab, list);
+    //println!("{:?}", &nnet);
     
 // build training loop:
     for _ in 0..BATCHES{
         let (x_batch,y_batch) = construct_batch(&x,&y);
         //println!("batch: {:?}", &x_batch);
-        let (p,a1,emb_arr) = nnet.clone().forward_pass(x_batch.clone());
-        let bp = nnet.backwards_pass(p.clone(),a1,y_batch.clone());
+        let (probs,a1,z1,emb_array) = nnet.forward_pass(x_batch.clone());
+        let bp = nnet.backwards_pass(probs.clone(), a1,z1,emb_array.clone(),y_batch.clone());
+        //println!("lookup_grad: {:?}", bp.0.shape());
+        //println!("input_grad: {:?}", bp.1.shape());
+        //println!("input_weights: {:?}", nnet.input_weights.shape());
+        //println!("output_w_grad: {:?}", bp.2.shape());
+        //println!("output_b_grad: {:?}", bp.3.shape());
         //println!("lookup_grad: {:?}", &bp.0);
         //println!("lookup table: {:?}", nnet.lookup_table);
-        nnet.update_lookup(bp.0, x_batch, emb_arr);
-        //println!("updated_lookup:{:?}", nnet.lookup_table)
-        let loss = cross_entropy_loss(p,y_batch);
+        //println!("updated_lookup:{:?}", nnet.lookup_table);
+        let loss = cross_entropy_loss(probs,y_batch);
+        nnet.update_lookup(bp.0, x_batch, emb_array);
         nnet.update_rest((bp.1,bp.2,bp.3));
-        println!("{:?}", loss);
+        println!("LOSS: {:?}", loss);
     }
+    //println!("{:?}", &nnet);
 }
 
 const BLOCK_SIZE: usize = 3;
 const BATCH_SIZE: usize = 50;
-const DIMENSIONS: usize = 2;
-const HIDDEN_SIZE: usize = 10;
-const BATCHES: usize = 3;
+const DIMENSIONS: usize = 10;
+const HIDDEN_SIZE: usize = 15;
+const BATCHES: usize = 1;
 const LEARNING_RATE: f64 = 0.01;
 
 // test ideas: ensure indexing into the lookup table is working correctly (embeddig func)

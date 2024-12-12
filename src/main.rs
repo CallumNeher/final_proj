@@ -79,14 +79,13 @@ fn cross_entropy_loss(probs: Array2<f64>, y_batch: Vec<usize>) -> f64 {
     loss / y_batch.len() as f64
     
 }
-
-fn xavier_initialization(rows: usize, cols: usize) -> Array2<f64> {
+//trying a new initialization
+fn he_initialization(rows: usize, cols: usize) -> Array2<f64> {
     let mut rng = rand::thread_rng();
-    let fan_in = rows as f64;
-    let fan_out = cols as f64;
-    let limit = (6.0 / (fan_in + fan_out)).sqrt();
+    let limit = (2.0 / rows as f64).sqrt();
     Array2::from_shape_fn((rows, cols), |_| rng.gen_range(-limit..limit))
 }
+
 
 #[derive(Clone, Debug)]
 struct Network {
@@ -99,16 +98,16 @@ struct Network {
 impl Network {
     fn new() -> Network {
         let mut rng = rand::thread_rng();
-        let lookup_table = xavier_initialization(27,DIMENSIONS);
-        let input_weights = xavier_initialization(BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE);
-        let output_weights = xavier_initialization(HIDDEN_SIZE,27);
-        let output_bias = Array1::from_shape_fn(27, |_| rng.gen_range(0.0..1.0));
+        let lookup_table = he_initialization(27,DIMENSIONS);
+        let input_weights = he_initialization(BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE);
+        let output_weights = he_initialization(HIDDEN_SIZE,27);
+        let output_bias = Array1::from_elem((27), 0.0);
         Network {lookup_table,input_weights,output_weights, output_bias}
     }
     //fn sigmoid(x: Array2<f64>) -> Array2<f64> {
         //x.mapv(|z| 1.0 / (1.0 + (-z).exp()))
     //}
-
+//trying out ReLu over sigmoid...
     fn ReLu(x:Array2<f64>) -> Array2<f64> {
         x.mapv(|z| z.max(0.0))
     }
@@ -145,7 +144,6 @@ impl Network {
             emb_vec.push(embedding.into_iter().flatten().collect());
         }
         let emb_array: Array2<f64> = Array2::from_shape_vec((BATCH_SIZE, BLOCK_SIZE*DIMENSIONS ), emb_vec.into_iter().flatten().collect()).unwrap();
-        //println!("emb_array: {:?}", &emb_array);
         let z1: Array2<f64> = emb_array.clone().dot(&self.input_weights);
         let a1 = Network::ReLu(z1.clone());
         let z2 = a1.clone().dot(&self.output_weights) + self.output_bias.clone();
@@ -162,11 +160,14 @@ impl Network {
         for (index, corr_output) in y_batch.iter().enumerate(){
             grad_z2[(index, corr_output.clone())] -= 1.0; // subtracting 1 from targets to backpropagate over cross entropy loss
         }
+        //println!("grad_z2 max: {:?}", &grad_z2.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
         let grad_output_weights = a1.t().dot(&grad_z2); 
         let grad_output_bias = grad_z2.sum_axis(Axis(0));
-        let grad_a1 = Network::ReLu_Deriv(z1).dot(&grad_output_weights);
-        let grad_input_weights = emb_array.t().dot(&grad_a1);
-        let grad_embedding = grad_a1.dot(&self.input_weights.t());
+        let grad_a1 = grad_z2.dot(&self.output_weights.t());
+
+        let grad_z1 = grad_a1.clone() * a1.clone() * (a1.clone().mapv(|x| if x > 0.0 { 1.0 } else { 0.0 }));
+        let grad_input_weights = emb_array.t().dot(&grad_z1);
+        let grad_embedding = grad_z1.dot(&self.input_weights.t());
         return (grad_embedding,grad_input_weights,grad_output_weights,grad_output_bias)
     }
     fn update_lookup(&mut self, grad_embedding: Array2<f64>, x_batch: Vec<VecDeque<usize>>, emb_array:Array2<f64>){
@@ -182,7 +183,7 @@ impl Network {
             }
         }
         let update_as_arr: Array2<f64> = Array::from_shape_vec((27, DIMENSIONS), update_vec.into_iter().flatten().collect()).unwrap();
-        self.lookup_table.add_assign(&update_as_arr);
+        self.lookup_table.add_assign(&(update_as_arr / BATCH_SIZE as f64));
         //println!("sum_vec: {:?}", sums_vec);
         //println!("count_vec: {:?}", count_vec);
         
@@ -203,25 +204,17 @@ fn main() {
     let mut nnet = Network::new();
     let (x,y) = build_dataset(alphab, list);
     //println!("{:?}", &nnet);
-    
-// build training loop:
-    for _ in 0..BATCHES{
+
+    for epoch in 0..BATCHES{
         let (x_batch,y_batch) = construct_batch(&x,&y);
         //println!("batch: {:?}", &x_batch);
         let (probs,a1,z1,emb_array) = nnet.forward_pass(x_batch.clone());
         let bp = nnet.backwards_pass(probs.clone(), a1,z1,emb_array.clone(),y_batch.clone());
-        //println!("lookup_grad: {:?}", bp.0.shape());
-        //println!("input_grad: {:?}", bp.1.shape());
-        //println!("input_weights: {:?}", nnet.input_weights.shape());
-        //println!("output_w_grad: {:?}", bp.2.shape());
-        //println!("output_b_grad: {:?}", bp.3.shape());
-        //println!("lookup_grad: {:?}", &bp.0);
-        //println!("lookup table: {:?}", nnet.lookup_table);
-        //println!("updated_lookup:{:?}", nnet.lookup_table);
         let loss = cross_entropy_loss(probs,y_batch);
         nnet.update_lookup(bp.0, x_batch, emb_array);
         nnet.update_rest((bp.1,bp.2,bp.3));
         println!("LOSS: {:?}", loss);
+
     }
     //println!("{:?}", &nnet);
 }
@@ -229,7 +222,7 @@ fn main() {
 const BLOCK_SIZE: usize = 3;
 const BATCH_SIZE: usize = 50;
 const DIMENSIONS: usize = 10;
-const HIDDEN_SIZE: usize = 15;
+const HIDDEN_SIZE: usize = 64;
 const BATCHES: usize = 1;
 const LEARNING_RATE: f64 = 0.01;
 

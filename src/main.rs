@@ -82,8 +82,20 @@ fn cross_entropy_loss(probs: Array2<f64>, y_batch: Vec<usize>) -> f64 {
 //trying a new initialization
 fn he_initialization(rows: usize, cols: usize) -> Array2<f64> {
     let mut rng = rand::thread_rng();
-    let limit = (2.0 / rows as f64).sqrt();
+    let limit = 5.0 / (3.0 * (rows as f64).sqrt());
     Array2::from_shape_fn((rows, cols), |_| rng.gen_range(-limit..limit))
+}
+
+fn tanh(input: Array2<f64>) -> Array2<f64>{
+    input.mapv(|x| x.tanh())
+}
+fn subtract_row_max(input: &mut Array2<f64>) {
+    let max_vals = input.map_axis(Axis(1), |row| {
+        row.fold(f64::NEG_INFINITY, |max, &val| f64::max(max, val))
+    });
+    for (mut row, &max_val) in input.rows_mut().into_iter().zip(max_vals.iter()){
+        row.mapv_inplace(|x| x-max_val);
+    }
 }
 
 
@@ -103,16 +115,6 @@ impl Network {
         let output_weights = he_initialization(HIDDEN_SIZE,27);
         let output_bias = Array1::from_elem((27), 0.0);
         Network {lookup_table,input_weights,output_weights, output_bias}
-    }
-    //fn sigmoid(x: Array2<f64>) -> Array2<f64> {
-        //x.mapv(|z| 1.0 / (1.0 + (-z).exp()))
-    //}
-//trying out ReLu over sigmoid...
-    fn ReLu(x:Array2<f64>) -> Array2<f64> {
-        x.mapv(|z| z.max(0.0))
-    }
-    fn ReLu_Deriv(x: Array2<f64>) -> Array2<f64> {
-        x.mapv(|z| if z>0.0 {1.0} else {0.0})
     }
 
     fn embed(&self, labels: VecDeque<usize>) -> Vec<Vec<f64>> {
@@ -137,37 +139,40 @@ impl Network {
     unembedded
     }
 
-    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> (Array2<f64>,Array2<f64>, Array2<f64>, Array2<f64>) {
+    fn forward_pass(&self, batch: Vec<VecDeque<usize>>) -> (Array2<f64>,Array2<f64>,Array2<f64>) {
         let mut emb_vec: Vec<Vec<f64>> = Vec::new();
         for x in batch.iter(){
             let embedding = self.embed(x.clone());
             emb_vec.push(embedding.into_iter().flatten().collect());
         }
         let emb_array: Array2<f64> = Array2::from_shape_vec((BATCH_SIZE, BLOCK_SIZE*DIMENSIONS ), emb_vec.into_iter().flatten().collect()).unwrap();
-        let z1: Array2<f64> = emb_array.clone().dot(&self.input_weights);
-        let a1 = Network::ReLu(z1.clone());
-        let z2 = a1.clone().dot(&self.output_weights) + self.output_bias.clone();
-        let a2 = Network::ReLu(z2);
-        let mut probs = a2.clone().map(|x| x.exp());
+        let mut hpreact: Array2<f64> = emb_array.clone().dot(&self.input_weights);
+        let h = tanh(hpreact);
+        let mut logits = h.dot(&self.output_weights) + &self.output_bias;
+        subtract_row_max(&mut logits);
+        let counts = logits.clone().mapv(|x| x.exp());
+        let mut probs = counts.clone();
         for mut row in probs.axis_iter_mut(Axis(0)) {
             let row_sum: f64 = row.iter().sum::<f64>().clone();
             row /= row_sum;
         }
-        return (probs,a1,z1,emb_array)
+        return (emb_array,h,probs)
     }
-    fn backwards_pass(&self, probs: Array2<f64>, a1: Array2<f64>, z1: Array2<f64>,  emb_array: Array2<f64>, y_batch: Vec<usize>) -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>){
-        let mut grad_z2 = probs.clone();
+    fn backwards_pass(&self, probs: Array2<f64>, h: Array2<f64>, emb_array: Array2<f64>, y_batch: Vec<usize>) -> (Array2<f64>, Array2<f64>, Array2<f64>, Array1<f64>){
+        let mut grad_logits = probs.clone();
         for (index, corr_output) in y_batch.iter().enumerate(){
-            grad_z2[(index, corr_output.clone())] -= 1.0; // subtracting 1 from targets to backpropagate over cross entropy loss
+            grad_logits[(index, corr_output.clone())] -= 1.0; // subtracting 1 from targets to backpropagate over cross entropy loss
         }
-        //println!("grad_z2 max: {:?}", &grad_z2.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
-        let grad_output_weights = a1.t().dot(&grad_z2); 
-        let grad_output_bias = grad_z2.sum_axis(Axis(0));
-        let grad_a1 = grad_z2.dot(&self.output_weights.t());
-
-        let grad_z1 = grad_a1.clone() * a1.clone() * (a1.clone().mapv(|x| if x > 0.0 { 1.0 } else { 0.0 }));
-        let grad_input_weights = emb_array.t().dot(&grad_z1);
-        let grad_embedding = grad_z1.dot(&self.input_weights.t());
+        grad_logits.mapv_inplace(|x| x/ BATCH_SIZE as f64);
+        let grad_h = grad_logits.dot(&self.output_weights.t());
+        let grad_output_weights = h.t().dot(&grad_logits); 
+        let grad_output_bias = grad_logits.sum_axis(Axis(0));
+        let mut grad_hpreact = &h*&h;
+        grad_hpreact.mapv_inplace(|x| 1.0 -x);
+        grad_hpreact = grad_hpreact * grad_h; // backwards through tanh
+        let grad_input_weights = emb_array.t().dot(&grad_hpreact);
+        let grad_embedding = grad_hpreact.dot(&self.input_weights.t());
+        
         return (grad_embedding,grad_input_weights,grad_output_weights,grad_output_bias)
     }
     fn update_lookup(&mut self, grad_embedding: Array2<f64>, x_batch: Vec<VecDeque<usize>>, emb_array:Array2<f64>){
@@ -189,41 +194,42 @@ impl Network {
         
         
     }
-
+// NEED TO FIGURE OUT HOW TO UPDATE GRADIENTS IN PLACE
     fn update_rest(&mut self, gradients: (Array2<f64>, Array2<f64>, Array1<f64>)) {
         let (grad_input_weights,grad_output_weights,grad_output_bias) = gradients; 
-        self.input_weights = self.input_weights.clone() + grad_input_weights * LEARNING_RATE;
-        self.output_weights = self.output_weights.clone() + grad_output_weights * LEARNING_RATE;
-        self.output_bias = self.output_bias.clone() + grad_output_bias * LEARNING_RATE;
+        self.input_weights += grad_input_weights * LEARNING_RATE;
+        self.output_weights += grad_output_weights * LEARNING_RATE;
+        self.output_bias += grad_output_bias * LEARNING_RATE;
     }
 }
 
 fn main() {
     let alphab = load_data("Alphabet Set.csv").expect("Unable to load alphabet");
-    let mut list = load_data("1900 Names.csv").expect("Unable to load Names");
+    let mut list = load_data("Big Names.csv").expect("Unable to load Names");
     let mut nnet = Network::new();
     let (x,y) = build_dataset(alphab, list);
-    //println!("{:?}", &nnet);
+    
 
     for epoch in 0..BATCHES{
         let (x_batch,y_batch) = construct_batch(&x,&y);
-        //println!("batch: {:?}", &x_batch);
-        let (probs,a1,z1,emb_array) = nnet.forward_pass(x_batch.clone());
-        let bp = nnet.backwards_pass(probs.clone(), a1,z1,emb_array.clone(),y_batch.clone());
+        let (emb_array,h,probs) = nnet.forward_pass(x_batch.clone());
+        let bp = nnet.backwards_pass(probs.clone(),h,emb_array.clone(),y_batch.clone());
         let loss = cross_entropy_loss(probs,y_batch);
         nnet.update_lookup(bp.0, x_batch, emb_array);
         nnet.update_rest((bp.1,bp.2,bp.3));
-        println!("LOSS: {:?}", loss);
+        if epoch%1000 == 0{
+            println!("Epoch: {:?}, Loss: {:?}", epoch, loss)
+        }
 
     }
     //println!("{:?}", &nnet);
 }
 
 const BLOCK_SIZE: usize = 3;
-const BATCH_SIZE: usize = 50;
+const BATCH_SIZE: usize = 32;
 const DIMENSIONS: usize = 10;
-const HIDDEN_SIZE: usize = 64;
-const BATCHES: usize = 1;
-const LEARNING_RATE: f64 = 0.01;
+const HIDDEN_SIZE: usize = 200;
+const BATCHES: usize = 200000;
+const LEARNING_RATE: f64 = 0.00001;
 
 // test ideas: ensure indexing into the lookup table is working correctly (embeddig func)

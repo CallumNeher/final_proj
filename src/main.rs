@@ -5,6 +5,11 @@ use std::collections::HashMap;
 use std::collections::VecDeque;
 use rand::Rng;
 use std::ops::AddAssign;
+use std::env;
+use std::io;
+use std::io::Write;
+use rand::distributions::WeightedIndex;
+use rand::prelude::*;
 
 // Load Data in
 
@@ -50,10 +55,10 @@ fn build_dataset(alphabet: Vec<String>, mut words: Vec<String>)-> (Vec<VecDeque<
         for character in word.chars() {
             let lett = character.to_string();
             let ind = char_to_ind.get(&lett).expect("couldn't find character in tokenizer");
-            context.pop_back();
-            context.push_front(ind.clone());
             x.push(context.clone());
             y.push(ind.clone());
+            context.pop_back();
+            context.push_front(ind.clone());
         }
     }
     (x,y)
@@ -74,7 +79,7 @@ fn construct_batch(data: &Vec<VecDeque<usize>>, y: &Vec<usize>) -> (Vec<VecDeque
 fn cross_entropy_loss(probs: Array2<f64>, y_batch: Vec<usize>) -> f64 {
     let mut loss = 0.0;
     for (index, &corr_output) in y_batch.iter().enumerate() {
-        loss -= probs[(index, corr_output)].ln();
+        loss -= (probs[(index, corr_output)]+ 1e-10).ln();
     }
     loss / y_batch.len() as f64
     
@@ -86,7 +91,7 @@ fn he_initialization(rows: usize, cols: usize) -> Array2<f64> {
     Array2::from_shape_fn((rows, cols), |_| rng.gen_range(-limit..limit))
 }
 
-fn tanh(input: Array2<f64>) -> Array2<f64>{
+fn tanh<D>(input: Array<f64, D>) -> Array<f64, D> where D: ndarray::Dimension{
     input.mapv(|x| x.tanh())
 }
 fn subtract_row_max(input: &mut Array2<f64>) {
@@ -163,66 +168,125 @@ impl Network {
         for (index, corr_output) in y_batch.iter().enumerate(){
             grad_logits[(index, corr_output.clone())] -= 1.0; // subtracting 1 from targets to backpropagate over cross entropy loss
         }
-        grad_logits.mapv_inplace(|x| x/ BATCH_SIZE as f64);
+        //grad_logits.mapv_inplace(|x| x/ BATCH_SIZE as f64);
         let grad_h = grad_logits.dot(&self.output_weights.t());
         let grad_output_weights = h.t().dot(&grad_logits); 
         let grad_output_bias = grad_logits.sum_axis(Axis(0));
         let mut grad_hpreact = &h*&h;
         grad_hpreact.mapv_inplace(|x| 1.0 -x);
-        grad_hpreact = grad_hpreact * grad_h; // backwards through tanh
+        grad_hpreact = &grad_hpreact * &grad_h; // backwards through tanh
         let grad_input_weights = emb_array.t().dot(&grad_hpreact);
         let grad_embedding = grad_hpreact.dot(&self.input_weights.t());
         
         return (grad_embedding,grad_input_weights,grad_output_weights,grad_output_bias)
     }
-    fn update_lookup(&mut self, grad_embedding: Array2<f64>, x_batch: Vec<VecDeque<usize>>, emb_array:Array2<f64>){
-        let updated_emb = emb_array + grad_embedding * LEARNING_RATE;
-        let unembedded = self.unembed(updated_emb);
-        let mut update_vec: Vec<Vec<f64>> = vec![vec![0.0;DIMENSIONS];27];
+    fn update_lookup(&mut self, learning_rate:f64, grad_embedding: Array2<f64>, x_batch: Vec<VecDeque<usize>>, mut emb_array:Array2<f64>){
         for (outer_ind,context) in x_batch.iter().enumerate(){
-            for (inner_ind,label) in context.to_owned().iter().enumerate(){
-                let update_vals = &unembedded[outer_ind][inner_ind];
-                for (val_ind, val) in update_vals.iter().enumerate(){
-                    update_vec[label.clone()][val_ind] += val;
-                }
+            for (inner_ind,label) in context.iter().enumerate(){
+                let grad = grad_embedding.slice(s![outer_ind,inner_ind*DIMENSIONS..(inner_ind+1)*DIMENSIONS]);
+                self.lookup_table.scaled_add(-learning_rate, &grad);
             }
         }
-        let update_as_arr: Array2<f64> = Array::from_shape_vec((27, DIMENSIONS), update_vec.into_iter().flatten().collect()).unwrap();
-        self.lookup_table.add_assign(&(update_as_arr / BATCH_SIZE as f64));
-        //println!("sum_vec: {:?}", sums_vec);
-        //println!("count_vec: {:?}", count_vec);
-        
-        
     }
-// NEED TO FIGURE OUT HOW TO UPDATE GRADIENTS IN PLACE
-    fn update_rest(&mut self, gradients: (Array2<f64>, Array2<f64>, Array1<f64>)) {
-        let (grad_input_weights,grad_output_weights,grad_output_bias) = gradients; 
-        self.input_weights += grad_input_weights * LEARNING_RATE;
-        self.output_weights += grad_output_weights * LEARNING_RATE;
-        self.output_bias += grad_output_bias * LEARNING_RATE;
+//checked
+    fn update_rest(&mut self, learning_rate:f64, gradients: (Array2<f64>, Array2<f64>, Array1<f64>)) {
+        let (mut grad_input_weights, mut grad_output_weights, mut grad_output_bias) = gradients; 
+        self.input_weights.scaled_add(-learning_rate,&grad_input_weights);
+        self.output_weights.scaled_add(-learning_rate,&grad_output_weights);
+        self.output_bias.scaled_add(-learning_rate,&grad_output_bias)
+    }
+
+    fn sample_from_net(&self, input: String, alphabet: Vec<String>){
+        let (ind_to_char, char_to_ind) = create_tokenizers(alphabet);
+        let mut context: VecDeque<usize> = VecDeque::new();
+        let mut out_vec: Vec<usize> = Vec::new();
+        for _ in 0..BLOCK_SIZE {
+            context.push_front(0 as usize);
+        }
+        for character in input.chars() {
+            let letter = character.to_string();
+            let ind = char_to_ind.get(&letter).expect("couldn't find input character in tokenizer");
+            context.push_front(ind.clone());
+            context.pop_back();
+            out_vec.push(*ind);
+            //println!("context init: {:?}", &context);
+        }
+        let mut rng = thread_rng();
+        loop { //essentially a repeated forward pass and context update
+            let embedding = self.embed(context.clone());
+            let emb_array: Array2<f64> = Array2::from_shape_vec((1,BLOCK_SIZE*DIMENSIONS), embedding.into_iter().flatten().collect()).unwrap();
+            let mut hpreact: Array2<f64> = emb_array.dot(&self.input_weights);
+            let h = tanh(hpreact);
+            let mut logits = h.dot(&self.output_weights) + &self.output_bias;
+            let counts = logits.clone().mapv(|x| x.exp());
+            let mut probs = counts.clone();
+            for mut row in probs.axis_iter_mut(Axis(0)) {
+                let row_sum: f64 = row.iter().sum::<f64>().clone();
+                row /= row_sum;
+            }
+            let probs_vec = probs.into_raw_vec_and_offset();
+            let dist = WeightedIndex::new(&probs_vec.0).expect("Unable to create probability sampling dist");
+            let index = dist.sample(&mut rng);
+            out_vec.push(index.clone());
+            context.push_front(index.clone());
+            context.pop_back();
+            //println!("context update: {:?}", &context);
+            if index == 0{
+                break
+            }
+        }
+        //println!("out vec: {:?}", out_vec);
+        let mut return_string = String::default();
+        for val in out_vec.iter(){
+            let letter = ind_to_char.get(&val).unwrap();
+            return_string = return_string + &letter;
+        }
+        println!("New name: {:?}", &return_string);
     }
 }
+
+fn read_input(prompt: &str) -> String { //from a prev hw assignmnet of mine
+    print!("{}", prompt);
+    io::stdout().flush().unwrap();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).expect("Failed to read input");
+    input.trim().to_lowercase()
+}
+
+
 
 fn main() {
     let alphab = load_data("Alphabet Set.csv").expect("Unable to load alphabet");
     let mut list = load_data("Big Names.csv").expect("Unable to load Names");
     let mut nnet = Network::new();
-    let (x,y) = build_dataset(alphab, list);
-    
+    let (x,y) = build_dataset(alphab.clone(), list);
+    let mut learning_rate = 0.01;
+    //println!("{:?}", &nnet);    
 
     for epoch in 0..BATCHES{
         let (x_batch,y_batch) = construct_batch(&x,&y);
         let (emb_array,h,probs) = nnet.forward_pass(x_batch.clone());
         let bp = nnet.backwards_pass(probs.clone(),h,emb_array.clone(),y_batch.clone());
         let loss = cross_entropy_loss(probs,y_batch);
-        nnet.update_lookup(bp.0, x_batch, emb_array);
-        nnet.update_rest((bp.1,bp.2,bp.3));
-        if epoch%1000 == 0{
+        nnet.update_lookup(learning_rate.clone(), bp.0, x_batch, emb_array);
+        nnet.update_rest(learning_rate.clone(), (bp.1,bp.2,bp.3));
+        if epoch == BATCHES/2 {
+            learning_rate = learning_rate*0.1;
+        }
+        if epoch%10000 == 0{
             println!("Epoch: {:?}, Loss: {:?}", epoch, loss)
         }
 
     }
     //println!("{:?}", &nnet);
+    loop{
+        let input: String = read_input("Input Starting Letters (type 'end' to exit): ");
+        if input == "end" {
+            break
+        }
+        nnet.sample_from_net(input, alphab.clone());
+    }
+
 }
 
 const BLOCK_SIZE: usize = 3;
@@ -230,6 +294,5 @@ const BATCH_SIZE: usize = 32;
 const DIMENSIONS: usize = 10;
 const HIDDEN_SIZE: usize = 200;
 const BATCHES: usize = 200000;
-const LEARNING_RATE: f64 = 0.00001;
 
 // test ideas: ensure indexing into the lookup table is working correctly (embeddig func)

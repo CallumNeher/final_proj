@@ -24,10 +24,6 @@ fn load_data(path:&str) -> Result<Vec<String>, Box<dyn Error>> {
     Ok(words)
 }
 
-// construct a character tokenizer
-
-
-
 //build Dataset
 
 fn build_dataset(alphabet: Vec<String>, mut words: Vec<String>)-> ((Vec<VecDeque<usize>>, Vec<usize>),(Vec<VecDeque<usize>>, Vec<usize>)) {
@@ -92,7 +88,23 @@ fn cross_entropy_loss(probs: Array2<f64>, y_batch: Vec<usize>) -> f64 {
     loss / y_batch.len() as f64
     
 }
-//trying a new initialization
+
+fn plot(vowels: Vec<(f64,f64)>, consonants: Vec<(f64,f64)>, placeholder: Vec<(f64,f64)>) -> Result<(), Box<dyn std::error::Error>> {
+    let root = BitMapBackend::new("visual.png", (640, 480)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let root = root.titled("Plotting Letters on 2 dimensions", ("Arial", 20).into_font())?;
+    
+    let mut chart = ChartBuilder::on(&root)
+        .caption("Vowels: Green, Consonants: Red", ("Arial", 20).into_font())
+        .x_label_area_size(80)
+        .y_label_area_size(80)
+        .build_cartesian_2d(-1f64..1f64, -1f64..1f64)?;
+    chart.configure_mesh().draw()?;
+    chart.draw_series(consonants.iter().map(|(x,y)| Circle::new((*x,*y),3,RED.filled())))?;
+    chart.draw_series(vowels.iter().map(|(x,y)| Circle::new((*x,*y),3,GREEN.filled())))?;
+    chart.draw_series(placeholder.iter().map(|(x,y)| Circle::new((*x,*y),3,BLACK.filled())))?;
+    Ok(())
+}
 
 fn read_input(prompt: &str) -> String { //from a prev hw assignmnet of mine
     print!("{}", prompt);
@@ -145,27 +157,70 @@ fn main() {
     let consonants = tuple_vec;
 //PLOT ONLY IMPLEMENTED FOR 2 DIMENSIONAL CHARACTER EMBEDDINGS
 // For maximum model accuracy, 10 dimensional embeddings is recommended, but 2 dimensional embeddings are easier to visualize
-    let _ = plot(vowels, consonants, placeholder);
+    if DIMENSIONS == 2{
+        let _ = plot(vowels, consonants, placeholder);
+    }
 }
-
-fn plot(vowels: Vec<(f64,f64)>, consonants: Vec<(f64,f64)>, placeholder: Vec<(f64,f64)>) -> Result<(), Box<dyn std::error::Error>> {
-    let root = BitMapBackend::new("visual.png", (640, 480)).into_drawing_area();
-    root.fill(&WHITE)?;
-    let root = root.titled("Plotting Letters on 2 dimensions", ("Arial", 20).into_font())?;
-    
-    let mut chart = ChartBuilder::on(&root)
-        .caption("Vowels: Green, Consonants: Red", ("Arial", 20).into_font())
-        .x_label_area_size(80)
-        .y_label_area_size(80)
-        .build_cartesian_2d(-1f64..1f64, -1f64..1f64)?;
-    chart.configure_mesh().draw()?;
-    chart.draw_series(consonants.iter().map(|(x,y)| Circle::new((*x,*y),3,RED.filled())))?;
-    chart.draw_series(vowels.iter().map(|(x,y)| Circle::new((*x,*y),3,GREEN.filled())))?;
-    chart.draw_series(placeholder.iter().map(|(x,y)| Circle::new((*x,*y),3,BLACK.filled())))?;
-    Ok(())
-}
-
 
 const BATCH_SIZE: usize = 32;
-const BATCHES: usize = 1;
+const BATCHES: usize = 200000;
 const BLOCK_SIZE: usize = 3;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use network::{subtract_row_max, tanh};
+    const DIMENSIONS: usize = 2;
+    #[test]
+    fn test_forward_pass() { // testing the forward pass logic:
+        let test_net = Network::new();
+        let t_context = VecDeque::from([0,1,0]);
+        let batch = vec![t_context.clone(),t_context];
+
+        //forward pass implementation with tweaked emb_array size:
+        let mut emb_vec: Vec<Vec<f64>> = Vec::new();
+        for x in batch.iter(){
+            let embedding = test_net.embed(x.clone());
+            emb_vec.push(embedding.into_iter().flatten().collect());
+        }
+        let emb_array: Array2<f64> = Array2::from_shape_vec((batch.len(), 3*DIMENSIONS ), emb_vec.into_iter().flatten().collect()).unwrap();
+        let hpreact: Array2<f64> = emb_array.clone().dot(&test_net.input_weights);
+        let h = tanh(hpreact);
+        let mut logits = h.dot(&test_net.output_weights) + &test_net.output_bias;
+        subtract_row_max(&mut logits);
+        let counts = logits.clone().mapv(|x| x.exp());
+        let mut probs = counts.clone();
+        for mut row in probs.axis_iter_mut(Axis(0)) {
+            let row_sum: f64 = row.iter().sum::<f64>().clone();
+            row /= row_sum;
+        }
+
+    assert!((probs.sum() - 2.0).abs() <= 0.0001); //all elements of our prob vector should add to 2, 
+    //because there are 2 normalized rows in it (one for each context in input)
+    }
+    const HIDDEN_SIZE: usize = 200;
+
+    #[test]
+    fn test_backwards_pass() { //test shapes and values of gradients
+        let test_net = Network::new();
+        let batch_size = 2;
+        let probs = Array2::from_shape_vec((batch_size, 27), vec![0.1; batch_size * 27]).unwrap();
+        let h = Array2::from_shape_vec((batch_size, HIDDEN_SIZE), vec![0.5; batch_size * HIDDEN_SIZE]).unwrap();
+        let emb_array = Array2::from_shape_vec((batch_size, BLOCK_SIZE * DIMENSIONS), vec![0.1; batch_size * BLOCK_SIZE * DIMENSIONS]).unwrap();
+        let y_batch = vec![1, 2];
+        let (grad_embedding, grad_input_weights, grad_output_weights, grad_output_bias) = test_net.backwards_pass(probs.clone(), h.clone(), emb_array.clone(), y_batch);
+        //ensure shapes are correct
+        assert_eq!(emb_array.shape(),grad_embedding.shape());
+        assert_eq!(test_net.input_weights.shape(),grad_input_weights.shape());
+        assert_eq!(test_net.output_weights.shape(),grad_output_weights.shape());
+        assert_eq!(test_net.output_bias.shape(),grad_output_bias.shape());
+        
+        //ensure there are non zero values
+        assert!(grad_embedding.iter().any(|&x| x != 0.0));
+        assert!(grad_input_weights.iter().any(|&x| x != 0.0));
+        assert!(grad_output_weights.iter().any(|&x| x != 0.0));
+        assert!(grad_output_bias.iter().any(|&x| x != 0.0));
+        
+    }
+
+}

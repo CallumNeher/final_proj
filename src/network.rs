@@ -5,7 +5,7 @@ use rand::Rng;
 use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 
-const DIMENSIONS: usize = 2;
+const DIMENSIONS: usize = 10;
 const BLOCK_SIZE: usize = 3;
 const HIDDEN_SIZE: usize = 200;
 
@@ -19,14 +19,14 @@ pub struct Network {
 
 impl Network {
     pub fn new() -> Network {
-        let lookup_table = he_initialization(27,DIMENSIONS);
-        let input_weights = he_initialization(BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE);
-        let output_weights = he_initialization(HIDDEN_SIZE,27);
+        let lookup_table = initialization(27,DIMENSIONS);
+        let input_weights = initialization(BLOCK_SIZE*DIMENSIONS, HIDDEN_SIZE);
+        let output_weights = initialization(HIDDEN_SIZE,27);
         let output_bias = Array1::from_elem(27, 0.0);
         Network {lookup_table,input_weights,output_weights, output_bias}
     }
 
-    fn embed(&self, labels: VecDeque<usize>) -> Vec<Vec<f64>> {
+    pub fn embed(&self, labels: VecDeque<usize>) -> Vec<Vec<f64>> {
         let mut rows: Vec<Vec<f64>> = Vec::new();
         for &elem in labels.iter() {
             let embedding = self.lookup_table.slice(s![elem, .. ]).to_owned();
@@ -150,16 +150,16 @@ pub fn create_tokenizers(alphabet: Vec<String>)-> (HashMap<usize,String>, HashMa
     (ind_char, char_ind)
 }
 
-fn he_initialization(rows: usize, cols: usize) -> Array2<f64> {
+fn initialization(rows: usize, cols: usize) -> Array2<f64> {
     let mut rng = rand::thread_rng();
     let limit = 5.0 / (3.0 * (rows as f64).sqrt());
     Array2::from_shape_fn((rows, cols), |_| rng.gen_range(-limit..limit))
 }
 
-fn tanh<D>(input: Array<f64, D>) -> Array<f64, D> where D: ndarray::Dimension{
+pub fn tanh<D>(input: Array<f64, D>) -> Array<f64, D> where D: ndarray::Dimension{
     input.mapv(|x| x.tanh())
 }
-fn subtract_row_max(input: &mut Array2<f64>) {
+pub fn subtract_row_max(input: &mut Array2<f64>) {
     let max_vals = input.map_axis(Axis(1), |row| {
         row.fold(f64::NEG_INFINITY, |max, &val| f64::max(max, val))
     });
